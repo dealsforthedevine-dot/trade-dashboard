@@ -3,15 +3,87 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-st.set_page_config(page_title="Account Statement Dashboard", layout="wide")
+# ----------------- PAGE CONFIG -----------------
+st.set_page_config(
+    page_title="Account Statement Dashboard",
+    layout="wide",
+)
+
+# ----------------- GLOBAL STYLES (LIGHT + GLASS) -----------------
+st.markdown(
+    """
+    <style>
+    /* Remove default padding */
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 1.5rem;
+        padding-left: 2rem;
+        padding-right: 2rem;
+    }
+
+    /* Glass cards */
+    .glass-card {
+        background: rgba(173, 216, 230, 0.25); /* light blue tint */
+        border-radius: 16px;
+        padding: 16px 20px;
+        border: 1px solid rgba(255, 255, 255, 0.6);
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        margin-bottom: 12px;
+    }
+    .glass-title {
+        font-size: 0.80rem;
+        font-weight: 600;
+        color: #4b5563;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 4px;
+    }
+    .glass-value {
+        font-size: 1.35rem;
+        font-weight: 700;
+        color: #0f172a;
+    }
+    .glass-sub {
+        font-size: 0.75rem;
+        color: #6b7280;
+        margin-top: 2px;
+    }
+
+    /* Sidebar width + style */
+    section[data-testid="stSidebar"] {
+        width: 80px !important;
+        min-width: 80px !important;
+        background-color: #ffffff !important;
+        border-right: 1px solid #e5e7eb;
+    }
+    /* Center icons in sidebar */
+    .sidebar-icon {
+        text-align: center;
+        font-size: 1.4rem;
+        padding-top: 0.4rem;
+        padding-bottom: 0.1rem;
+    }
+    .sidebar-label {
+        text-align: center;
+        font-size: 0.70rem;
+        color: #4b5563;
+        margin-bottom: 0.6rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Schwab / ThinkorSwim Account Statement Dashboard")
 
+# ----------------- FILE UPLOAD -----------------
 uploaded_file = st.file_uploader("Upload Account Statement export", type=["csv", "txt"])
 if not uploaded_file:
     st.stop()
 
 # --------- SECTION DEFINITIONS (column-based detection) ---------
-
 SECTION_PATTERNS = {
     "CASH_BALANCE": ["DATE", "TIME", "TYPE", "DESCRIPTION", "AMOUNT", "BALANCE"],
     "FUTURES_STMT": ["Trade Date", "Exec Date", "Exec Time", "Description", "Amount", "Balance"],
@@ -35,11 +107,13 @@ ACCOUNT_SUMMARY_KEYS = [
     "Total Commissions & Fees YTD",
 ]
 
+
 def detect_section(line: str):
     for name, cols in SECTION_PATTERNS.items():
         if all(col in line for col in cols):
             return name
     return None
+
 
 def parse_statement(file):
     text = file.read().decode("utf-8", errors="ignore")
@@ -92,24 +166,25 @@ def parse_statement(file):
             try:
                 df = pd.read_csv(io.StringIO(block), sep=None, engine="python")
                 frames.append(df)
-            except:
+            except Exception:
                 pass
         if frames:
             dfs[name] = pd.concat(frames, ignore_index=True)
 
     return dfs, account_summary
 
-def safe_float_series(s):
-    """Convert a Series to float safely, ignoring non‑numeric values."""
+
+def safe_float_series(s: pd.Series) -> pd.Series:
     return (
         pd.to_numeric(
             s.astype(str)
              .str.replace("[,$]", "", regex=True)
              .str.replace(" ", "", regex=False)
              .replace("", "0"),
-            errors="coerce"
+            errors="coerce",
         ).fillna(0.0)
     )
+
 
 dfs, acct_summary = parse_statement(uploaded_file)
 
@@ -118,21 +193,19 @@ if not dfs and not acct_summary:
     st.stop()
 
 # ----------------- HIGH-LEVEL METRICS -----------------
-
-# Net Liq from Account Summary
 net_liq = None
 if "Net Liquidating Value" in acct_summary:
     try:
-        net_liq = float(acct_summary["Net Liquidating Value"].replace(",", "").replace("$", ""))
-    except:
+        net_liq = float(
+            acct_summary["Net Liquidating Value"].replace(",", "").replace("$", "")
+        )
+    except Exception:
         net_liq = None
 
-# Daily P/L from PNL section
 daily_pl = None
 if "PNL" in dfs and "P/L Day" in dfs["PNL"].columns:
     daily_pl = safe_float_series(dfs["PNL"]["P/L Day"]).sum()
 
-# Total income / outflow from cash-like sections
 total_inflow = 0.0
 total_outflow = 0.0
 for sec_name in ["CASH_BALANCE", "FUTURES_STMT", "FOREX", "CRYPTO"]:
@@ -148,13 +221,11 @@ for sec_name in ["CASH_BALANCE", "FUTURES_STMT", "FOREX", "CRYPTO"]:
             total_inflow += vals[vals > 0].sum()
             total_outflow += vals[vals < 0].sum()
 
-# Open positions count
 open_positions = 0
 for sec_name in ["EQUITIES", "OPTIONS_POS", "FUTURES_POS"]:
     if sec_name in dfs:
         open_positions += len(dfs[sec_name])
 
-# Win rate from TRADES (very rough: positive Net Price vs negative)
 win_rate = None
 if "TRADES" in dfs and "Net Price" in dfs["TRADES"].columns:
     np_series = safe_float_series(dfs["TRADES"]["Net Price"])
@@ -163,29 +234,86 @@ if "TRADES" in dfs and "Net Price" in dfs["TRADES"].columns:
     if total_trades > 0:
         win_rate = wins / total_trades * 100.0
 
-# ----------------- LAYOUT: TABS -----------------
+# ----------------- SIDEBAR NAVIGATION -----------------
+with st.sidebar:
+    st.markdown("<div class='sidebar-icon'>🏠</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sidebar-label'>Overview</div>", unsafe_allow_html=True)
 
-tabs = st.tabs(["Overview", "Positions", "Orders & Trades", "Cash & P/L", "Account Summary"])
+    st.markdown("<div class='sidebar-icon'>📊</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sidebar-label'>Positions</div>", unsafe_allow_html=True)
 
-# -------- Overview Tab --------
-with tabs[0]:
+    st.markdown("<div class='sidebar-icon'>🔁</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sidebar-label'>Orders</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='sidebar-icon'>💵</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sidebar-label'>Cash & P/L</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='sidebar-icon'>📘</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sidebar-label'>Summary</div>", unsafe_allow_html=True)
+
+    # Actual control (hidden label, uses same order as icons)
+    section = st.radio(
+        "",
+        ["Overview", "Positions", "Orders & Trades", "Cash & P/L", "Account Summary"],
+        index=0,
+        label_visibility="collapsed",
+    )
+
+# ----------------- KPI GLASS CARDS -----------------
+kpi_cols = st.columns(6)
+
+def glass_card(col, title, value, sub=None):
+    with col:
+        html = f"""
+        <div class="glass-card">
+            <div class="glass-title">{title}</div>
+            <div class="glass-value">{value}</div>
+            {f'<div class="glass-sub">{sub}</div>' if sub else ''}
+        </div>
+        """
+        st.markdown(html, unsafe_allow_html=True)
+
+glass_card(
+    kpi_cols[0],
+    "Net Liq",
+    f"${net_liq:,.2f}" if net_liq is not None else "—",
+)
+glass_card(
+    kpi_cols[1],
+    "Daily P/L",
+    f"${daily_pl:,.2f}" if daily_pl is not None else "—",
+)
+glass_card(
+    kpi_cols[2],
+    "Total Inflow",
+    f"${total_inflow:,.2f}",
+)
+glass_card(
+    kpi_cols[3],
+    "Total Outflow",
+    f"${total_outflow:,.2f}",
+)
+glass_card(
+    kpi_cols[4],
+    "Win Rate",
+    f"{win_rate:.1f}%" if win_rate is not None else "—",
+)
+glass_card(
+    kpi_cols[5],
+    "Open Positions",
+    str(open_positions),
+)
+
+st.markdown("---")
+
+# ----------------- MAIN SECTIONS -----------------
+if section == "Overview":
     st.subheader("Overview")
 
-    col1, col2, col3, col4 = st.columns(4)
+    col_left, col_right = st.columns([2, 1])
 
-    with col1:
-        st.metric("Net Liquidating Value", f"${net_liq:,.2f}" if net_liq is not None else "—")
-    with col2:
-        st.metric("Daily P/L", f"${daily_pl:,.2f}" if daily_pl is not None else "—")
-    with col3:
-        st.metric("Total Inflow", f"${total_inflow:,.2f}")
-    with col4:
-        st.metric("Total Outflow", f"${total_outflow:,.2f}")
-
-    col5, col6 = st.columns([2, 1])
-
-    # Portfolio allocation pie (by Mark Value or Qty)
-    with col5:
+    # Portfolio allocation
+    with col_left:
         st.markdown("### Portfolio Allocation")
         alloc_rows = []
 
@@ -223,7 +351,7 @@ with tabs[0]:
             st.info("No position data available for allocation chart.")
 
     # Recent activity
-    with col6:
+    with col_right:
         st.markdown("### Recent Activity")
         recent = None
         if "TRADES" in dfs:
@@ -238,8 +366,7 @@ with tabs[0]:
         else:
             st.info("No recent trades or orders found.")
 
-# -------- Positions Tab --------
-with tabs[1]:
+elif section == "Positions":
     st.subheader("Open Positions")
 
     pos_tabs = st.tabs(["Equities", "Options", "Futures"])
@@ -265,8 +392,7 @@ with tabs[1]:
         else:
             st.info("No futures positions found.")
 
-# -------- Orders & Trades Tab --------
-with tabs[2]:
+elif section == "Orders & Trades":
     st.subheader("Orders & Trades")
 
     ot_tabs = st.tabs(["Orders", "Trades"])
@@ -292,8 +418,7 @@ with tabs[2]:
         else:
             st.info("No trades section found.")
 
-# -------- Cash & P/L Tab --------
-with tabs[3]:
+elif section == "Cash & P/L":
     st.subheader("Cash & P/L")
 
     cp_tabs = st.tabs(["Cash Flow", "P/L Summary"])
@@ -328,8 +453,7 @@ with tabs[3]:
         else:
             st.info("No P/L section found.")
 
-# -------- Account Summary Tab --------
-with tabs[4]:
+elif section == "Account Summary":
     st.subheader("Account Summary")
     if acct_summary:
         summary_df = pd.DataFrame(
