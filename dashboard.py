@@ -100,12 +100,15 @@ def parse_statement(file):
     return dfs, account_summary
 
 def safe_float_series(s):
+    """Convert a Series to float safely, ignoring non‑numeric values."""
     return (
-        s.astype(str)
-        .str.replace("[,$]", "", regex=True)
-        .str.replace(" ", "", regex=False)
-        .replace("", "0")
-        .astype(float)
+        pd.to_numeric(
+            s.astype(str)
+             .str.replace("[,$]", "", regex=True)
+             .str.replace(" ", "", regex=False)
+             .replace("", "0"),
+            errors="coerce"
+        ).fillna(0.0)
     )
 
 dfs, acct_summary = parse_statement(uploaded_file)
