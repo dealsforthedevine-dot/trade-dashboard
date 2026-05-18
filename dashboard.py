@@ -1,273 +1,424 @@
 # dashboard.py
-import re
 import io
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
 st.set_page_config(
-    page_title="Trade Analytics Dashboard",
+    page_title="Schwab / ThinkorSwim Account Statement Analyzer",
     layout="wide",
 )
 
-# ---------- Helpers ----------
-
-def parse_tos_description(desc: str):
-    """
-    Parse ThinkorSwim DESCRIPTION field like:
-    'SOLD -10 SOXL 100 (Weeklys) 22 MAY 26 144 PUT @5.25 CBOE'
-    """
-    if not isinstance(desc, str):
-        return None, None, None, None, None, None
-
-    # Action
-    action = "SELL" if "SOLD" in desc.upper() else "BUY" if "BOT" in desc.upper() else None
-
-    # Qty (handles -10 or +10)
-    qty_match = re.search(r'([+-]?\d+)\s+[A-Z]+ 100', desc)
-    qty = int(qty_match.group(1)) if qty_match else None
-
-    # Symbol
-    sym_match = re.search(r'\s([A-Z]+)\s+100', desc)
-    symbol = sym_match.group(1) if sym_match else None
-
-    # Expiration (e.g. '22 MAY 26')
-    exp_match = re.search(r'(\d{1,2}\s+[A-Z]{3}\s+\d{2})', desc)
-    expiration = exp_match.group(1) if exp_match else None
-
-    # Strike
-    strike_match = re.search(r'\s(\d+(\.\d+)?)\s+(CALL|PUT)', desc)
-    strike = float(strike_match.group(1)) if strike_match else None
-
-    # Call/Put
-    cp_match = re.search(r'(CALL|PUT)', desc)
-    cp = cp_match.group(1) if cp_match else None
-
-    # Price
-    price_match = re.search(r'@(\d+(\.\d+)?)', desc)
-    price = float(price_match.group(1)) if price_match else None
-
-    return action, qty, symbol, expiration, strike, cp, price
-
-
-def load_tos_csv(file) -> pd.DataFrame:
-    # Try to read as tab or comma separated
-    content = file.read()
-    try:
-        df = pd.read_csv(io.BytesIO(content), sep="\t")
-    except Exception:
-        df = pd.read_csv(io.BytesIO(content))
-
-    # Normalize column names
-    df.columns = [c.strip().upper() for c in df.columns]
-
-    # Parse description into structured fields
-    parsed = df["DESCRIPTION"].apply(parse_tos_description)
-    df[["ACTION", "QTY", "SYMBOL", "EXPIRATION", "STRIKE", "CP", "PRICE"]] = pd.DataFrame(
-        parsed.tolist(), index=df.index
-    )
-
-    # Cash flow (AMOUNT) if present
-    if "AMOUNT" in df.columns:
-        df["AMOUNT_CLEAN"] = (
-            df["AMOUNT"]
-            .astype(str)
-            .str.replace("[,$]", "", regex=True)
-            .astype(float)
-        )
-    else:
-        df["AMOUNT_CLEAN"] = 0.0
-
-    # Build a trade key per contract
-    df["TRADE_KEY"] = (
-        df["SYMBOL"].astype(str)
-        + "_"
-        + df["EXPIRATION"].astype(str)
-        + "_"
-        + df["STRIKE"].astype(str)
-        + "_"
-        + df["CP"].astype(str)
-    )
-
-    # Combine DATE + TIME if present
-    if "DATE" in df.columns:
-        if "TIME" in df.columns:
-            df["DATETIME"] = pd.to_datetime(df["DATE"] + " " + df["TIME"], errors="coerce")
-        else:
-            df["DATETIME"] = pd.to_datetime(df["DATE"], errors="coerce")
-    else:
-        df["DATETIME"] = pd.NaT
-
-    return df
-
-
-def build_trade_summary(df: pd.DataFrame) -> pd.DataFrame:
-    # Aggregate by TRADE_KEY to get net P/L per contract group
-    grp = df.groupby("TRADE_KEY", dropna=False)
-
-    summary = grp.agg(
-        SYMBOL=("SYMBOL", "first"),
-        EXPIRATION=("EXPIRATION", "first"),
-        STRIKE=("STRIKE", "first"),
-        CP=("CP", "first"),
-        QTY_NET=("QTY", "sum"),
-        CASH_FLOW=("AMOUNT_CLEAN", "sum"),
-        FIRST_DT=("DATETIME", "min"),
-        LAST_DT=("DATETIME", "max"),
-    ).reset_index()
-
-    # Define outcome: positive cash flow = profit (for closed trades)
-    summary["P_L"] = summary["CASH_FLOW"]
-    summary["OUTCOME"] = summary["P_L"].apply(lambda x: "Win" if x > 0 else "Loss" if x < 0 else "Flat")
-
-    # Simple R-multiple placeholder
-    losses = summary.loc[summary["P_L"] < 0, "P_L"].abs()
-    avg_loss = losses.mean() if not losses.empty else 1.0
-    summary["R_MULTIPLE"] = summary["P_L"] / avg_loss if avg_loss != 0 else 0
-
-    return summary
-
-
-# ---------- UI ----------
-
-st.title("Trade Analytics Dashboard")
+st.title("Account Statement Analyzer")
 
 st.markdown(
-    "Upload your **ThinkorSwim trade export** (CSV or TXT). "
-    "This app will parse the DESCRIPTION field, group trades, and show analytics."
+    "Upload your **Schwab / ThinkorSwim Account Statement export** (CSV/TXT). "
+    "This app detects sections (Cash, Futures, Forex, Crypto, Orders, Trades, "
+    "Equities, Options, Futures positions, P/L, Account Summary) and builds analytics."
 )
 
-uploaded_file = st.file_uploader("Upload ThinkorSwim export", type=["csv", "txt"])
+uploaded_file = st.file_uploader("Upload Account Statement export", type=["csv", "txt"])
 
 if not uploaded_file:
-    st.info("Upload a ThinkorSwim export file to get started.")
+    st.info("Upload your Account Statement file to get started.")
     st.stop()
 
+# ---------- Section definitions (by exact header line) ----------
+
+SECTION_HEADERS = {
+    # Cash balance section
+    "CASH_BALANCE": "DATE\tTIME\tTYPE\tREF #\tDESCRIPTION\tMisc Fees\tCommissions & Fees\tAMOUNT\tBALANCE",
+    # Futures statement (cash-style)
+    "FUTURES_STMT": "Trade Date\tExec Date\tExec Time\tType\tRef #\tDescription\tMisc Fees\tCommissions & Fees\tAmount\tBalance",
+    # Forex statements
+    "FOREX": "Date\tTime\tType\tRef #\tDescription\tCommissions & Fees\tAmount\tAmount(USD)\tBalance",
+    # Crypto
+    "CRYPTO": "Trade Date\tExec Date\tExec Time\tType\tRef #\tDescription\tCommissions & Fees\tAmount\tBalance",
+    # Account order history
+    "ORDERS": "Notes\t\tTime Placed\tSpread\tSide\tQty\tPos Effect\tSymbol\tExp\tStrike\tType\tPRICE\t\tTIF\tStatus",
+    # Account trade history
+    "TRADES": "Exec Time\tSpread\tSide\tQty\tPos Effect\tSymbol\tExp\tStrike\tType\tPrice\tNet Price\tOrder Type",
+    # Equities positions
+    "EQUITIES": "Symbol\tDescription\tQty\tTrade Price",
+    # Options positions
+    "OPTIONS_POS": "Symbol\tExp\tStrike\tType\tTrade Price\tMark\tQty\tP/L Day\tP/L Open\tOption Code\tP/L %\tMark Value",
+    # Futures positions
+    "FUTURES_POS": "Symbol\tDescription\tSPC\tExp\tQty\tTrade Price\tP/L Day",
+    # Profits and Losses summary
+    "PNL": "Symbol\tDescription\tP/L Open\tP/L %\tP/L Day\tP/L YTD\tP/L Diff\tMargin Req\tMark Value",
+    # Account Summary (we'll treat as key/value lines, not a tabular header)
+    # We'll detect it by a line starting with 'Account Summary'
+}
+
+ACCOUNT_SUMMARY_KEYS = [
+    "Net Liquidating Value",
+    "Stock Buying Power",
+    "Option Buying Power",
+    "Equity Commissions & Fees YTD",
+    "Futures Commissions & Fees YTD",
+    "Crypto Trading Fees YTD",
+    "Total Commissions & Fees YTD",
+]
+
+def detect_section(line: str):
+    line_stripped = line.strip()
+    for name, header in SECTION_HEADERS.items():
+        if line_stripped == header:
+            return name
+    return None
+
+def parse_multi_section_statement(file):
+    """Return dict: {section_name: DataFrame} and account_summary dict."""
+    content = file.read()
+    try:
+        text = content.decode("utf-8")
+    except AttributeError:
+        text = content
+
+    lines = text.splitlines()
+
+    sections_raw = {name: [] for name in SECTION_HEADERS.keys()}
+    current_section = None
+    buffer = []
+
+    account_summary = {}
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Detect Account Summary block
+        if stripped.startswith("Account Summary"):
+            # Consume following lines until blank
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != "":
+                row = lines[j].strip()
+                # Expect something like: "Net Liquidating Value\t123,456.78"
+                parts = row.split("\t")
+                if len(parts) >= 2:
+                    key = parts[0].strip()
+                    val = "\t".join(parts[1:]).strip()
+                    if key in ACCOUNT_SUMMARY_KEYS:
+                        account_summary[key] = val
+                j += 1
+            i = j
+            continue
+
+        sec = detect_section(line)
+        if sec is not None:
+            # flush previous
+            if current_section is not None and buffer:
+                sections_raw[current_section].append("\n".join(buffer))
+            current_section = sec
+            buffer = [SECTION_HEADERS[sec]]  # start with header
+        else:
+            if current_section is not None:
+                buffer.append(line)
+
+        i += 1
+
+    # flush last
+    if current_section is not None and buffer:
+        sections_raw[current_section].append("\n".join(buffer))
+
+    # Convert each section to DataFrame
+    dfs = {}
+    for name, blocks in sections_raw.items():
+        if not blocks:
+            continue
+        frames = []
+        for block in blocks:
+            try:
+                df = pd.read_csv(io.StringIO(block), sep="\t")
+                frames.append(df)
+            except Exception:
+                continue
+        if frames:
+            dfs[name] = pd.concat(frames, ignore_index=True)
+
+    return dfs, account_summary
+
+def safe_float_series(s):
+    return (
+        s.astype(str)
+        .str.replace("[,$]", "", regex=True)
+        .str.replace(" ", "", regex=False)
+        .replace("", "0")
+        .astype(float)
+    )
+
+# ---------- Parse file ----------
+
 try:
-    raw_df = load_tos_csv(uploaded_file)
+    section_dfs, account_summary = parse_multi_section_statement(uploaded_file)
 except Exception as e:
     st.error(f"Error reading file: {e}")
     st.stop()
 
-summary_df = build_trade_summary(raw_df)
+if not section_dfs and not account_summary:
+    st.error("No recognizable sections found. Check that this is a Schwab / TOS Account Statement export.")
+    st.stop()
 
-# Strategy tagging (Support/Resistance, FVG, etc.)
-st.sidebar.header("Filters & Tags")
+detected = list(section_dfs.keys())
+if account_summary:
+    detected.append("ACCOUNT_SUMMARY")
+st.success(f"Detected sections: {', '.join(detected)}")
 
-# Add a simple manual tag column if not present
-if "SETUP_TYPE" not in summary_df.columns:
-    summary_df["SETUP_TYPE"] = "Unlabeled"
+# ---------- Tabs ----------
 
-# Let user tag by symbol or trade key
-with st.sidebar.expander("Tag trades (SR / FVG / Other)", expanded=False):
-    editable = st.data_editor(
-        summary_df[["TRADE_KEY", "SYMBOL", "P_L", "OUTCOME", "SETUP_TYPE"]],
-        num_rows="dynamic",
-        key="tag_editor",
-    )
-    summary_df = summary_df.drop(columns=["SETUP_TYPE"]).merge(
-        editable[["TRADE_KEY", "SETUP_TYPE"]],
-        on="TRADE_KEY",
-        how="left",
-    )
+tab_labels = []
+if "CASH_BALANCE" in section_dfs:
+    tab_labels.append("Cash")
+if "FUTURES_STMT" in section_dfs:
+    tab_labels.append("Futures Statement")
+if "FOREX" in section_dfs:
+    tab_labels.append("Forex")
+if "CRYPTO" in section_dfs:
+    tab_labels.append("Crypto")
+if "ORDERS" in section_dfs:
+    tab_labels.append("Order History")
+if "TRADES" in section_dfs:
+    tab_labels.append("Trade History")
+if "EQUITIES" in section_dfs:
+    tab_labels.append("Equities")
+if "OPTIONS_POS" in section_dfs:
+    tab_labels.append("Options Positions")
+if "FUTURES_POS" in section_dfs:
+    tab_labels.append("Futures Positions")
+if "PNL" in section_dfs:
+    tab_labels.append("P/L Summary")
+if account_summary:
+    tab_labels.append("Account Summary")
 
-# Filters
-symbols = sorted(summary_df["SYMBOL"].dropna().unique().tolist())
-selected_symbols = st.sidebar.multiselect("Symbols", symbols, default=symbols)
+tabs = st.tabs(tab_labels)
+tab_index = 0
 
-setup_types = sorted(summary_df["SETUP_TYPE"].dropna().unique().tolist())
-selected_setups = st.sidebar.multiselect("Setup Types", setup_types, default=setup_types)
+# ----- Cash tab -----
+if "CASH_BALANCE" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Cash Balance")
+        cash_df = section_dfs["CASH_BALANCE"].copy()
 
-filtered = summary_df[
-    summary_df["SYMBOL"].isin(selected_symbols)
-    & summary_df["SETUP_TYPE"].isin(selected_setups)
-]
+        for col in ["Misc Fees", "Commissions & Fees", "AMOUNT", "BALANCE"]:
+            if col in cash_df.columns:
+                cash_df[col + "_NUM"] = safe_float_series(cash_df[col])
 
-# ---------- Top metrics ----------
+        st.dataframe(cash_df, use_container_width=True)
 
-total_trades = len(filtered)
-wins = (filtered["OUTCOME"] == "Win").sum()
-losses = (filtered["OUTCOME"] == "Loss").sum()
-win_rate = wins / total_trades * 100 if total_trades > 0 else 0
-net_pl = filtered["P_L"].sum()
-avg_r = filtered["R_MULTIPLE"].mean() if total_trades > 0 else 0
+        if "BALANCE_NUM" in cash_df.columns and "DATE" in cash_df.columns and "TIME" in cash_df.columns:
+            cash_df["DATETIME"] = pd.to_datetime(
+                cash_df["DATE"].astype(str) + " " + cash_df["TIME"].astype(str),
+                errors="coerce",
+            )
+            cash_df = cash_df.sort_values("DATETIME")
+            fig = px.line(
+                cash_df,
+                x="DATETIME",
+                y="BALANCE_NUM",
+                title="Cash Balance Over Time",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    tab_index += 1
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total Trades", total_trades)
-col2.metric("Win Rate", f"{win_rate:.1f}%")
-col3.metric("Net P/L", f"{net_pl:,.2f}")
-col4.metric("Avg R Multiple", f"{avg_r:.2f}")
+# ----- Futures statement tab -----
+if "FUTURES_STMT" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Futures Statement (Cash)")
+        fut_df = section_dfs["FUTURES_STMT"].copy()
 
-# ---------- Equity curve ----------
+        for col in ["Misc Fees", "Commissions & Fees", "Amount", "Balance"]:
+            if col in fut_df.columns:
+                fut_df[col + "_NUM"] = safe_float_series(fut_df[col])
 
-st.subheader("Equity Curve")
+        st.dataframe(fut_df, use_container_width=True)
 
-ec = raw_df.sort_values("DATETIME").copy()
-ec["CUM_P_L"] = ec["AMOUNT_CLEAN"].cumsum()
+        if "Amount_NUM" in fut_df.columns and "Exec Date" in fut_df.columns and "Exec Time" in fut_df.columns:
+            fut_df["DATETIME"] = pd.to_datetime(
+                fut_df["Exec Date"].astype(str) + " " + fut_df["Exec Time"].astype(str),
+                errors="coerce",
+            )
+            fut_df = fut_df.sort_values("DATETIME")
+            fut_df["CUM_P_L"] = fut_df["Amount_NUM"].cumsum()
+            fig = px.line(
+                fut_df,
+                x="DATETIME",
+                y="CUM_P_L",
+                title="Futures Cumulative P/L",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    tab_index += 1
 
-fig_ec = px.line(
-    ec,
-    x="DATETIME",
-    y="CUM_P_L",
-    title="Account Growth (Cumulative P/L)",
-)
-st.plotly_chart(fig_ec, use_container_width=True)
+# ----- Forex tab -----
+if "FOREX" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Forex Statements")
+        fx_df = section_dfs["FOREX"].copy()
 
-# ---------- Setup performance ----------
+        for col in ["Commissions & Fees", "Amount", "Amount(USD)", "Balance"]:
+            if col in fx_df.columns:
+                fx_df[col + "_NUM"] = safe_float_series(fx_df[col])
 
-st.subheader("Setup Performance (SR / FVG / Other)")
+        st.dataframe(fx_df, use_container_width=True)
 
-setup_perf = (
-    filtered.groupby("SETUP_TYPE")
-    .agg(
-        TRADES=("TRADE_KEY", "count"),
-        WIN_RATE=("OUTCOME", lambda x: (x == "Win").mean() * 100),
-        AVG_R=("R_MULTIPLE", "mean"),
-        NET_PL=("P_L", "sum"),
-    )
-    .reset_index()
-)
+        if "Amount(USD)_NUM" in fx_df.columns and "Date" in fx_df.columns and "Time" in fx_df.columns:
+            fx_df["DATETIME"] = pd.to_datetime(
+                fx_df["Date"].astype(str) + " " + fx_df["Time"].astype(str),
+                errors="coerce",
+            )
+            fx_df = fx_df.sort_values("DATETIME")
+            fx_df["CUM_P_L"] = fx_df["Amount(USD)_NUM"].cumsum()
+            fig = px.line(
+                fx_df,
+                x="DATETIME",
+                y="CUM_P_L",
+                title="Forex Cumulative P/L (USD)",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    tab_index += 1
 
-col_a, col_b = st.columns([2, 1])
+# ----- Crypto tab -----
+if "CRYPTO" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Crypto Statement")
+        c_df = section_dfs["CRYPTO"].copy()
 
-with col_a:
-    st.dataframe(setup_perf, use_container_width=True)
+        for col in ["Commissions & Fees", "Amount", "Balance"]:
+            if col in c_df.columns:
+                c_df[col + "_NUM"] = safe_float_series(c_df[col])
 
-with col_b:
-    fig_pie = px.pie(
-        setup_perf,
-        names="SETUP_TYPE",
-        values="TRADES",
-        title="Trades by Setup Type",
-    )
-    st.plotly_chart(fig_pie, use_container_width=True)
+        st.dataframe(c_df, use_container_width=True)
 
-# ---------- Trade table ----------
+        if "Amount_NUM" in c_df.columns and "Exec Date" in c_df.columns and "Exec Time" in c_df.columns:
+            c_df["DATETIME"] = pd.to_datetime(
+                c_df["Exec Date"].astype(str) + " " + c_df["Exec Time"].astype(str),
+                errors="coerce",
+            )
+            c_df = c_df.sort_values("DATETIME")
+            c_df["CUM_P_L"] = c_df["Amount_NUM"].cumsum()
+            fig = px.line(
+                c_df,
+                x="DATETIME",
+                y="CUM_P_L",
+                title="Crypto Cumulative P/L",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    tab_index += 1
 
-st.subheader("Trades")
+# ----- Order history tab -----
+if "ORDERS" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Account Order History")
+        o_df = section_dfs["ORDERS"].copy()
+        st.dataframe(o_df, use_container_width=True)
 
-st.dataframe(
-    filtered[
-        [
-            "TRADE_KEY",
-            "SYMBOL",
-            "EXPIRATION",
-            "STRIKE",
-            "CP",
-            "QTY_NET",
-            "P_L",
-            "R_MULTIPLE",
-            "OUTCOME",
-            "SETUP_TYPE",
-            "FIRST_DT",
-            "LAST_DT",
-        ]
-    ].sort_values("FIRST_DT"),
-    use_container_width=True,
-)
+        if "Symbol" in o_df.columns:
+            sym_counts = o_df["Symbol"].value_counts().reset_index()
+            sym_counts.columns = ["Symbol", "Orders"]
+            fig = px.bar(sym_counts, x="Symbol", y="Orders", title="Orders per Symbol")
+            st.plotly_chart(fig, use_container_width=True)
+    tab_index += 1
+
+# ----- Trade history tab -----
+if "TRADES" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Account Trade History")
+        t_df = section_dfs["TRADES"].copy()
+
+        if "Price" in t_df.columns:
+            t_df["Price_NUM"] = safe_float_series(t_df["Price"])
+        if "Net Price" in t_df.columns:
+            t_df["NetPrice_NUM"] = safe_float_series(t_df["Net Price"])
+
+        st.dataframe(t_df, use_container_width=True)
+
+        if "Symbol" in t_df.columns:
+            sym_counts = t_df["Symbol"].value_counts().reset_index()
+            sym_counts.columns = ["Symbol", "Trades"]
+            fig = px.bar(sym_counts, x="Symbol", y="Trades", title="Trades per Symbol")
+            st.plotly_chart(fig, use_container_width=True)
+
+        if "Exec Time" in t_df.columns:
+            fig2 = px.histogram(
+                t_df,
+                x="Exec Time",
+                title="Trade Time Distribution",
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+    tab_index += 1
+
+# ----- Equities tab -----
+if "EQUITIES" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Equities Positions")
+        e_df = section_dfs["EQUITIES"].copy()
+        st.dataframe(e_df, use_container_width=True)
+
+        if "Symbol" in e_df.columns and "Qty" in e_df.columns:
+            qty = safe_float_series(e_df["Qty"])
+            sym_qty = pd.DataFrame({"Symbol": e_df["Symbol"], "Qty": qty})
+            sym_qty = sym_qty.groupby("Symbol", as_index=False)["Qty"].sum()
+            fig = px.bar(sym_qty, x="Symbol", y="Qty", title="Equity Position Size by Symbol")
+            st.plotly_chart(fig, use_container_width=True)
+    tab_index += 1
+
+# ----- Options positions tab -----
+if "OPTIONS_POS" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Options Positions")
+        op_df = section_dfs["OPTIONS_POS"].copy()
+        st.dataframe(op_df, use_container_width=True)
+
+        if "Symbol" in op_df.columns and "Qty" in op_df.columns:
+            qty = safe_float_series(op_df["Qty"])
+            sym_qty = pd.DataFrame({"Symbol": op_df["Symbol"], "Qty": qty})
+            sym_qty = sym_qty.groupby("Symbol", as_index=False)["Qty"].sum()
+            fig = px.bar(sym_qty, x="Symbol", y="Qty", title="Options Position Size by Symbol")
+            st.plotly_chart(fig, use_container_width=True)
+    tab_index += 1
+
+# ----- Futures positions tab -----
+if "FUTURES_POS" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Futures Positions")
+        fp_df = section_dfs["FUTURES_POS"].copy()
+        st.dataframe(fp_df, use_container_width=True)
+
+        if "Symbol" in fp_df.columns and "Qty" in fp_df.columns:
+            qty = safe_float_series(fp_df["Qty"])
+            sym_qty = pd.DataFrame({"Symbol": fp_df["Symbol"], "Qty": qty})
+            sym_qty = sym_qty.groupby("Symbol", as_index=False)["Qty"].sum()
+            fig = px.bar(sym_qty, x="Symbol", y="Qty", title="Futures Position Size by Symbol")
+            st.plotly_chart(fig, use_container_width=True)
+    tab_index += 1
+
+# ----- P/L summary tab -----
+if "PNL" in section_dfs:
+    with tabs[tab_index]:
+        st.subheader("Profits and Losses Summary")
+        p_df = section_dfs["PNL"].copy()
+
+        for col in ["P/L Open", "P/L %", "P/L Day", "P/L YTD", "P/L Diff", "Margin Req", "Mark Value"]:
+            if col in p_df.columns:
+                p_df[col + "_NUM"] = safe_float_series(p_df[col])
+
+        st.dataframe(p_df, use_container_width=True)
+
+        if "Symbol" in p_df.columns and "P/L Day_NUM" in p_df.columns:
+            sym_pl = p_df.groupby("Symbol", as_index=False)["P/L Day_NUM"].sum()
+            fig = px.bar(sym_pl, x="Symbol", y="P/L Day_NUM", title="P/L Day by Symbol")
+            st.plotly_chart(fig, use_container_width=True)
+    tab_index += 1
+
+# ----- Account Summary tab -----
+if account_summary:
+    with tabs[tab_index]:
+        st.subheader("Account Summary")
+        summary_items = [{"Metric": k, "Value": v} for k, v in account_summary.items()]
+        summary_df = pd.DataFrame(summary_items)
+        st.table(summary_df)
 
 st.caption(
-    "You can refine the parser, add more metrics (ICT FVG efficiency, SR reliability, session stats), "
-    "and persist tags using a simple database later. For now, this gives you a working, local dashboard "
-    "that ingests ThinkorSwim exports directly."
+    "This dashboard parses the multi-section Schwab / ThinkorSwim Account Statement export and "
+    "builds analytics for cash, futures, forex, crypto, orders, trades, positions, P/L, and account summary."
 )
